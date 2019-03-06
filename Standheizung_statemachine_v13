@@ -1,0 +1,528 @@
+///////////////////////////////////////
+////   Include LCD 16x2 DISPLAY    ////
+///////////////////////////////////////
+#include<Wire.h>
+#include<LiquidCrystal_I2C.h>
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+///////////////////////////////////////
+////            INPUTS             ////
+///////////////////////////////////////
+
+unsigned long preheatDelay1 = 5;            // PREHEATING: delay fan starts up to rated speed
+unsigned long preheatDelay2 = 5;            // PREHEATING: delay preheating "dry" without diesel to prewarm the combustion chamber
+unsigned long preheatDelay3 = 5;            // PREHEATING: delay preheating with diesel to ignite diesel in combustion chamber
+unsigned long tempDelay = 10;               // TEMP_RISING: delay to reach normal heating temperature (compare minTemp) within certain time
+
+unsigned long refuelDelay = 10;             // REFUELING: delay for contdown until shut down because of diesel < 0% (marked on tank)
+
+int blinkDelay = 200;                       // SENSORING: fixed delay for Sensor-Measuremt-Frequency (Temperature, Ultrasonic)
+
+int heatingdiff = 10;                       // TEMPERATURE: defines "flame detected, turn Preheater off"  (T when heater was startet + x)
+int shutdowndiff = 10;                      // TEMPERATURE: defines "flame off, turn Fan off"             (T when heater was startet + x)
+int minTemp = 42;                           // TEMPERATURE: defines minimum T during heating              (based on youre heating system)
+int maxTemp = 60;                           // TEMPERATURE: defines maximum T during heating              (based on youre heating system) 
+
+int fuelTankHight = 30;                     // DIESEL LEVEL [cm]: defines minimal Diesel Level                 (distance sensor to button + 5cm safety)
+int dieselMin = 0;                          // DIESEL LEVEL [%]: % of fuelTankHight, defines minimum Level, causes forced shut down
+int dieselReserve = 5;                      // DIESEL LEVEL [%]: % of fuelTankHight, Grenzwert zum Auslösen der Alarm (5 % vor Markierung Diesel-Kanister)
+int dieselReset = 7;                        // DIESEL LEVEL [%]: % of fuelTankHight, causes deactivation of diesel-Alarme (has to be > dieselReserve)
+
+
+///////////////////////////////////////
+//// Constants & Vriables & States ////
+///////////////////////////////////////
+
+const int OUTA1 = 1;                        // Unused analog Pin, defined as output for safety
+const int OUTA2 = 2;                        // Unused analog Pin, defined as output for safety
+const int OUTA3 = 3;                        // Unused analog Pin, defined as output for safety
+const int OUTA4 = 4;                        // Unused analog Pin, defined as output for safety
+const int OUTA5 = 5;                        // Unused analog Pin, defined as output for safety
+const int OUTA6 = 6;                        // Unused analog Pin, defined as output for safety
+const int OUTA7 = 7;                        // Unused analog Pin, defined as output for safety
+const int OUTD2 = 2;                        // Actually the Optokoppler-Pin, not in use now, defined as output for safety
+const int OUTD13 = 13;                      // Unused digital Pin, defined as output for safety
+
+const int FAN_RELAIS = 5;                   // RELAIS 1: Activates the FAN
+const int PL_RELAIS = 6;                    // RELAIS 2: Switches between 50 and 100 % of rated power
+const int MAGNET_VALVE = 3;                 // RELAIS 3: Switches magnetic valve for Diesel
+const int PREHEATING_RELAIS = 4;            // RELAIS 4: Switches Preheating-Circle
+ 
+const int MAIN_SWITCH = 7;                  // BUTTON: On / STANDBY Main switch
+const int PL_SWITCH = 8;                    // BUTTON: Controlls PARTIAL_LOAD_RELAIS 
+const int DELAY_MAIN_SWITCH = 9;            // BUTTON: if switch is aktive, preheatingphases are on hold for manual intervention
+
+const int PING = 11;                        // ULTRASONIC Sensor Ping
+const int ECHO = 10;                        // ULTRASONIC Sensor Ping
+int duration, distance;                     // ULTRASONIC Variables for Calculation
+long level;
+
+int mainSwitchState;                        // DEBOUNCING: actual Input MainSwitch
+int lastmainSwitchState = LOW;              // DEBOUNCING: previous Input MainSwitch
+int mainSwitchInt = 0;                      // DEBOUNCING: first State MainSwitch after Systemstart
+int debounceDelay = 100;                    // DEBOUNCING: fixed delay
+unsigned long lastDebounceTime = 0;         // DEBOUNCING: last timestamp when main switch is used
+
+int PLSwitchState;                          // DEBOUNCING_PL: actual Input MainSwitch (PL = Partial Load)
+int lastPLSwitchState = LOW;                // DEBOUNCING_PL: previous Input MainSwitch
+int PLSwitchInt = 0;                        // DEBOUNCING_PL: first State MainSwitch after Systemstart
+int PLdebounceDelay = 100;                  // DEBOUNCING_PL: fixed delay
+unsigned long PLlastDebounceTime = 0;       // DEBOUNCING_PL: last timestamp when main switch is used
+
+int dieselint = 0;                          // DIESEL WARNING: int for hysteresis
+int acoustic = 1;                           // DIESEL WARNING: int for manual off "acoustic warning" 0==on 1==off
+unsigned long refuelAlarmeStart;            // DIESEL WARNING: delay function for Alarme on/off
+int refuelAlarmeint;                        // DEISEL WARNING: int for on/off case
+
+unsigned long preheatStart;                 // PREHEATING: timestamp for millis() delays in preheating phases
+unsigned long refuelStart;
+
+unsigned long i_1 = preheatDelay1;          // PREHEATING: 
+unsigned long i_2 = preheatDelay2;          // PREHEATING: 
+unsigned long i_3 = preheatDelay3;          // PREHEATING: 
+unsigned long i_5 = refuelDelay;            // Waiting for refueling until shut down
+unsigned long i_6 = tempDelay;              // Waiting for reaching min Temp
+
+unsigned long blinkStart;                   // SENSORING: variable for Sensor-Measuremt-Frequency (Temperature, Ultrasonic)
+
+int startTemp;                              // TEMPERATURE: saves ambient Temperature when Heater is starting, reference value for Temp threshold as heatingdiff + shutdowndiff
+
+int ThermistorPin = A0;                                                    // THERMISTOR
+int Vo;                                                                    // THERMISTOR
+float R1 = 10000;                                                          // THERMISTOR
+float logR2, R2, T, Tc;                                                    // THERMISTOR
+float c1 = 1.009249522e-03, c2 = 2.378405444e-04, c3 = 2.019202697e-07;    // THERMISTOR
+
+// Definition of Cases for the statemachine
+enum State {STANDBY, PREHEATING_1, PREHEATING_2, PREHEATING_3, HEATING_1, HEATING_2, SHUT_DOWN, ERROR};
+State currentState;
+State lastState = STANDBY;
+
+
+void setup()
+{
+  lcd.init();
+  lcd.backlight();
+// Defining all unused GPIOs
+  pinMode (OUTA1, OUTPUT);                                                // Unused analog Pin, defined as output for safety
+  pinMode (OUTA2, OUTPUT);                                                // Unused analog Pin, defined as output for safety
+  pinMode (OUTA3, OUTPUT);                                                // Unused analog Pin, defined as output for safety
+  pinMode (OUTA4, OUTPUT);                                                // Unused analog Pin, defined as output for safety
+  pinMode (OUTA5, OUTPUT);                                                // Unused analog Pin, defined as output for safety
+  pinMode (OUTA6, OUTPUT);                                                // Unused analog Pin, defined as output for safety
+  pinMode (OUTA7, OUTPUT);                                                // Unused analog Pin, defined as output for safety
+  pinMode (OUTD2, OUTPUT);                                                // Actually the Optokoppler-Pin, not in use now, defined as output for safety
+  pinMode (OUTD13, OUTPUT);                                               // Unused digital Pin, defined as output for safety
+// Defining all used GPIOs
+  pinMode (FAN_RELAIS, OUTPUT);
+  pinMode (PL_RELAIS, OUTPUT);
+  pinMode (MAGNET_VALVE, OUTPUT);
+  pinMode (PREHEATING_RELAIS, OUTPUT);
+  pinMode (MAIN_SWITCH, INPUT_PULLUP);
+  pinMode (PL_SWITCH, INPUT_PULLUP);
+  pinMode (PING, OUTPUT);
+  pinMode (ECHO, INPUT);
+  pinMode (DELAY_MAIN_SWITCH, INPUT_PULLUP);
+// Sets all Realais Low for safety
+  digitalWrite(FAN_RELAIS, LOW);
+  digitalWrite(PL_RELAIS, LOW);
+  digitalWrite(MAGNET_VALVE, LOW);
+  digitalWrite(PREHEATING_RELAIS, LOW);
+// First Display Input after Start
+  Serial.begin(9600);
+  lcd.clear(); // First screen after starting the Arduino
+  lcd.setCursor(0, 0); lcd.print(">> Standby");
+
+// warm acoustic welcome
+  tone(12, 100); delay(50);
+  noTone(12); delay(50);
+  tone(12, 400); delay(100); noTone(12); 
+}
+  
+void loop()
+{
+//  Serial.println(startTemp);
+  
+  if(millis() >= (blinkStart + blinkDelay)) 
+  {
+    blinkStart = millis();
+    
+  // Supersonic Sensor testing for diesel 
+    digitalWrite(PING, HIGH); // DIESEL CHECK
+    //delay(1);
+    digitalWrite(PING, LOW);
+    duration = pulseIn(ECHO, HIGH);
+    distance = (duration/2) / 2.91;
+    level = map(distance, 5*10, fuelTankHight*10, 100, 0);
+
+    lcd.setCursor(0, 2); lcd.print("          ");
+    lcd.setCursor(0,3);                               // Spalte 1, Zeile 3
+    if(level <10) lcd.print(" ");                     // ein leerzeichen wenn Zahl kleiner 2-stellig
+    if(level <100) lcd.print(" ");                    // ein leerzeichen wenn Zahl kleiner 3-stellig
+    lcd.print(level);                                 // level auf LCD anzeigen
+    lcd.print(" %    ");                              // % auf LCD anzeigen
+    
+  // Temperature Sensor Calculations
+    Vo = analogRead(ThermistorPin);
+    R2 = R1 * (1023.0 / (float)Vo - 1.0);
+    logR2 = log(R2);
+    T = (1.0 / (c1 + c2*logR2 + c3*logR2*logR2*logR2));
+    Tc = T - 273.15;
+    lcd.setCursor(16, 3); lcd.print(Tc,0);
+    lcd.setCursor(19, 3); lcd.print("C"); 
+  }    
+
+  // Debounce-Function with State-change 0 / 1 (safety)  
+    int reading = digitalRead(MAIN_SWITCH);
+    if (reading != lastmainSwitchState) {lastDebounceTime = millis();}
+    if ((millis() - lastDebounceTime) > debounceDelay) {
+      if (reading != mainSwitchState) {mainSwitchState = reading;
+        if (mainSwitchState == LOW) {mainSwitchInt = !mainSwitchInt;}}}
+    lastmainSwitchState = reading;
+
+  // Debounce-Function with State-change 0 / 1 (safety)  
+    int readingPL = digitalRead(PL_SWITCH);
+    if (readingPL != lastPLSwitchState) {PLlastDebounceTime = millis();}
+    if ((millis() - PLlastDebounceTime) > PLdebounceDelay) {
+      if (readingPL != PLSwitchState) {PLSwitchState = readingPL;
+        if (PLSwitchState == LOW) {PLSwitchInt = !PLSwitchInt;}}}
+    lastPLSwitchState = readingPL;
+   
+
+///////////////////////////////////////
+////         Statemachine          ////
+///////////////////////////////////////
+  switch (currentState){
+
+////////////////////////////////////////////////////////////////
+    case STANDBY:
+      if(mainSwitchInt == 1)
+      {
+        if(level <= dieselMin){
+          lcd.clear();
+          lcd.setCursor(0,0); lcd.print(">> Standby          ");
+          lcd.setCursor(0,1); lcd.print("Pruefe Diesel");
+          digitalWrite(FAN_RELAIS, LOW);        
+          acoustic = 1;
+          noTone(12);
+          mainSwitchInt = 0;
+          currentState = STANDBY;
+        }
+        else{
+          lcd.clear();
+          lcd.setCursor(0, 0); lcd.print(">> Anlaufen");
+          digitalWrite(FAN_RELAIS, HIGH);
+          digitalWrite(PL_RELAIS, LOW);
+          preheatStart = millis();
+          i_1 = preheatDelay1;
+          i_2 = preheatDelay2;
+          i_3 = preheatDelay3;
+          acoustic = 1; // sets the acoustic warning of low diesel "on" again
+          startTemp = Tc;        
+          currentState = PREHEATING_1; // Fan is starting up
+          }
+      }
+      if(digitalRead(DELAY_MAIN_SWITCH) == 0){
+        lcd.setCursor(0, 1); lcd.print("                    ");}
+    break;
+    
+////////////////////////////////////////////////////////////////
+    case PREHEATING_1:
+      if(millis() - preheatStart >= 1000)
+      {
+        preheatStart = millis();
+        i_1 = i_1-1;
+        lcd.setCursor(16,1); lcd.print("   s");
+        lcd.setCursor(16,1); lcd.print(i_1);
+      }
+      if(digitalRead(DELAY_MAIN_SWITCH) == 0)
+      {
+        i_1 = i_1 + 5;
+        lcd.setCursor(16,1); lcd.print(i_1);        
+        delay(500); // add 5 sec
+        acoustic = 1; // sets the acoustic warning of low diesel "on" again
+      }
+      if (i_1 == 0)
+      {
+        currentState = PREHEATING_2; // Preheating without diesel
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print(">> Vorheizen");
+        lcd.setCursor(0, 1); lcd.print("Diesel aus");
+        digitalWrite(PREHEATING_RELAIS, HIGH);
+        preheatStart = millis();
+      }
+      if(Tc > startTemp + heatingdiff){currentState = HEATING_1;}
+      if(mainSwitchInt == 0){currentState = SHUT_DOWN;lcd.clear();}
+      break;
+
+////////////////////////////////////////////////////////////////     
+    case PREHEATING_2: // preheating dry
+      if(millis() - preheatStart >= 1000)
+      {
+        preheatStart = millis();
+        i_2 = i_2-1;
+        lcd.setCursor(16,1); lcd.print("   s");
+        lcd.setCursor(16,1); lcd.print(i_2);
+      }
+      if(digitalRead(DELAY_MAIN_SWITCH) == 0)
+      {
+        i_2 = i_2 + 5;
+        lcd.setCursor(16,1); lcd.print(i_2);        
+        delay(500); // add 5 sec
+        acoustic = 1; // sets the acoustic warning of low diesel "on" again
+      }
+      if (i_2 == 0)
+      {
+        currentState = PREHEATING_3; // Preheating with diesel
+        lcd.clear();
+        lcd.setCursor(0, 0); lcd.print(">> Vorheizen");
+        lcd.setCursor(0, 1); lcd.print("Diesel ein");
+        digitalWrite(MAGNET_VALVE, HIGH);      
+        preheatStart = millis();
+      }
+      if(Tc > startTemp + heatingdiff) {currentState = HEATING_1;}
+      if(mainSwitchInt == 0){currentState = SHUT_DOWN;lcd.clear();}
+    break;
+
+////////////////////////////////////////////////////////////////       
+    case PREHEATING_3: // preheating wet
+      if(millis() - preheatStart >= 1000)
+      {
+        preheatStart = millis();
+        i_3 = i_3-1;
+        lcd.setCursor(16,1); lcd.print("   s");
+        lcd.setCursor(16,1); lcd.print(i_3);
+      }
+      if(digitalRead(DELAY_MAIN_SWITCH) == 0)
+      {
+        i_3 = i_3 + 5;
+        lcd.setCursor(16,1); lcd.print(i_3);        
+        delay(500); // add 5 sec
+        acoustic = 1; // sets the acoustic warning of low diesel "on" again
+      }
+      if (i_3 == 0)
+      {
+        digitalWrite(FAN_RELAIS, HIGH);
+        digitalWrite(PL_RELAIS, HIGH);
+        digitalWrite(MAGNET_VALVE, LOW);  
+        digitalWrite(PREHEATING_RELAIS, LOW);      
+        lcd.clear();
+        lcd.setCursor(0,0); lcd.print(">> Abschalten... ");
+        lcd.setCursor(0,1); lcd.print("Keine Flamme");   
+        currentState = ERROR;
+      } 
+      if(Tc > startTemp + heatingdiff){currentState = HEATING_1;}
+      if(mainSwitchInt == 0){currentState = SHUT_DOWN;lcd.clear();}
+    break;
+
+////////////////////////////////////////////////////////////////
+    case HEATING_1:
+      lcd.setCursor(0, 0);lcd.print(">> Anheizen ");
+      lcd.setCursor(0, 1);lcd.print("          ");
+      digitalWrite(PREHEATING_RELAIS, LOW);
+      digitalWrite(MAGNET_VALVE, HIGH);
+      
+      if(millis() - preheatStart >= 1000)
+      {
+        preheatStart = millis();
+        i_6 = i_6-1;
+        lcd.setCursor(16,1); lcd.print("   s");
+        lcd.setCursor(16,1); lcd.print(i_6);
+      }
+      if(digitalRead(DELAY_MAIN_SWITCH) == 0)
+      {
+        i_6 = i_6 + 5;
+        lcd.setCursor(16,1); lcd.print(i_6);        
+        delay(500); // add 5 sec
+        acoustic = 1; // sets the acoustic warning of low diesel "on" again
+      }
+      if (i_6 == 0)
+      {
+        digitalWrite(FAN_RELAIS, HIGH);
+        digitalWrite(PL_RELAIS, HIGH);
+        digitalWrite(MAGNET_VALVE, LOW);  
+        digitalWrite(PREHEATING_RELAIS, LOW);      
+        lcd.clear();
+        lcd.setCursor(0,0); lcd.print(">> Abschalten... ");
+        lcd.setCursor(0,1); lcd.print("Pruefe Brennkammer");   
+        currentState = ERROR;
+     } 
+       
+     if(Tc > minTemp){                  // Tests if Temp rised from startTemp to minTemp
+      currentState = HEATING_2;
+      lcd.setCursor(0, 0);lcd.print(">> Heizbetrieb");
+      lcd.setCursor(16,1); lcd.print("    ");}
+
+      if(mainSwitchInt == 0){currentState = SHUT_DOWN;lcd.clear();} 
+     break;
+
+////////////////////////////////////////////////////////////////
+    case HEATING_2: 
+    
+    // Switching of 50% / 100% Power
+      if(PLSwitchInt == 1){digitalWrite(PL_RELAIS, HIGH);}
+      else{digitalWrite(PL_RELAIS, LOW);}
+      
+    // Diesel-Controll Resets the Alarme in case of refueling during alarme
+      if (level >= 0 && dieselint == 0){
+          noTone(12);                                       // deaktivates Alarme
+          acoustic = 1;                                     // resets Alarme
+          i_5 = refuelDelay;                         // resets refuelDelay
+          lcd.setCursor(16,1); lcd.print("    ");           // resets refuelDelay Dislay
+          refuelAlarmeint = 1;                              // resets fuel Alarm for using in error-case
+        }
+        
+    // Reserve warning
+      if (level <= dieselReserve){           
+        dieselint = 1;
+        lcd.setCursor(6, 3); lcd.print("LOW");
+        if(acoustic == 1){
+          if(millis() - refuelAlarmeStart >= 1000){
+            refuelAlarmeStart = millis();
+            if(refuelAlarmeint == 1){
+              tone(12, 500);
+              refuelAlarmeint = 0;}
+            else{refuelAlarmeint = 1;
+              noTone(12);}
+          }
+        }
+        
+      // Blocking Signal-warning
+        if(digitalRead(DELAY_MAIN_SWITCH) == 0){     // sets the acoustic warning of low diesel "off"
+          delay(10);
+          acoustic = 0;
+          noTone(12);}
+        // Countdown Signal-warning
+          if(acoustic == 0){
+            if(millis() - refuelStart >= 1000){
+              refuelStart = millis();
+              i_5 = i_5-1;
+              lcd.setCursor(16,1); lcd.print("   s");
+              lcd.setCursor(16,1); lcd.print(i_5);}
+            if (i_5 == 0){
+              acoustic = 1;                                     // resets Alarme
+              i_5 = refuelDelay;                         // resets refuelDelay
+              lcd.setCursor(16,1); lcd.print("    ");}          // resets Display
+          }
+      }
+                                
+      if (level >= dieselReset)
+      {
+        dieselint = 0;                                          // resets fuel Alarm for using in error-case 
+        refuelAlarmeint = 1;                                    // Resets Diesel-Warning
+      }
+      
+    // Low-Diesel-Controll Shut-Down-Sequenz
+      if(level <= dieselMin)
+      {
+        noTone(12);                                       // deaktivates Alarme
+        acoustic = 1;                                     // resets Alarme
+        i_5 = refuelDelay;                         // resets refuelDelay
+        lcd.setCursor(16,1); lcd.print("    ");           // resets refuelDelay Dislay
+        
+        digitalWrite(FAN_RELAIS, HIGH);
+        digitalWrite(PL_RELAIS, HIGH);
+        digitalWrite(MAGNET_VALVE, LOW);  
+        digitalWrite(PREHEATING_RELAIS, LOW); 
+        lcd.setCursor(0,0); lcd.print(">> Abschalten... ");
+        lcd.setCursor(0,1); lcd.print("Pruefe Diesel");        
+        preheatStart = millis();
+        currentState = ERROR;
+      }
+    
+    // High-Temperature-Controll
+      if(Tc >= maxTemp) 
+      {
+        digitalWrite(FAN_RELAIS, HIGH);
+        digitalWrite(PL_RELAIS, HIGH);
+        digitalWrite(MAGNET_VALVE, LOW);  
+        digitalWrite(PREHEATING_RELAIS, LOW);  
+        lcd.clear();
+        lcd.setCursor(0,0); lcd.print(">> Abschalten... ");
+        lcd.setCursor(0,1); lcd.print("Temperatur zu hoch");
+        preheatStart = millis();
+        currentState = ERROR;
+      }
+    
+    // Low-Temperature-Controll
+      if(Tc <= minTemp) 
+      {
+        digitalWrite(FAN_RELAIS, HIGH);
+        digitalWrite(PL_RELAIS, HIGH);
+        digitalWrite(MAGNET_VALVE, LOW);  
+        digitalWrite(PREHEATING_RELAIS, LOW);  
+        lcd.clear();
+        lcd.setCursor(0,0); lcd.print(">> Abschalten... ");
+        lcd.setCursor(0,1); lcd.print("Pruefe Brennkammer");
+        preheatStart = millis();
+        currentState = ERROR;
+      }
+
+    // Activating Shut-Down-Sequenz  
+      if(mainSwitchInt == 0)
+      {
+        digitalWrite(MAGNET_VALVE, LOW);
+        digitalWrite(PL_RELAIS, HIGH);
+        //lcd.clear();
+        lcd.setCursor(0,0); lcd.print(">> Abschalten...");
+        preheatStart = millis();
+        currentState = SHUT_DOWN;
+      }
+      
+      break;
+    
+////////////////////////////////////////////////////////////////
+    case SHUT_DOWN:
+      if(mainSwitchInt == 1)
+      {    
+        currentState = PREHEATING_2;
+      }
+      if(Tc < startTemp + shutdowndiff)
+       {
+        lcd.setCursor(0,0); lcd.print(">> Standby          ");
+        digitalWrite(FAN_RELAIS, LOW);
+        digitalWrite(PL_RELAIS, LOW);
+        mainSwitchInt = 0;                               // if main button is pressed during shut_down
+        acoustic = 0;
+        noTone(12);
+        currentState = STANDBY;
+      }
+    break;
+
+////////////////////////////////////////////////////////////////
+    case ERROR:
+    // Blocking Signal-warning
+      if(digitalRead(DELAY_MAIN_SWITCH) == 0)            // sets the acoustic warning "off"
+      {    
+        delay(10);
+        acoustic = 0;
+        noTone(12);}
+
+      if(acoustic == 1 && millis() - refuelAlarmeStart >= 1000)
+      {
+        refuelAlarmeStart = millis();
+        if(refuelAlarmeint == 1)
+        {
+          tone(12, 500);
+          refuelAlarmeint = 0;
+        }
+        else
+        {
+          refuelAlarmeint = 1;
+          noTone(12);
+        }
+      }
+        
+      if(Tc < startTemp + shutdowndiff)
+      {
+        lcd.setCursor(0,0); lcd.print(">> Standby          ");
+        digitalWrite(FAN_RELAIS, LOW);
+        digitalWrite(PL_RELAIS, LOW);
+        mainSwitchInt = 0; // if main button is pressed during shut_down
+        acoustic = 1;
+        noTone(12);
+        currentState = STANDBY;
+      }
+    break;
+  }
+}
